@@ -1,0 +1,16 @@
+# docker-compose.yml - LMArena Bridge: selenium + noVNC browser
+# 用途：启动带 WebDriver(4444) 与 noVNC(7900) 的 Chrome 容器
+# 说明：api_server.py 建议仍在宿主机运行，容器内通过 host.docker.internal 回连宿主 5102/5103
+version: "3.9"
+services:
+  browser:
+    image: selenium/standalone-chrome:latest
+    container_name: lm_cf_browser
+    shm_size: "2g"
+    ports:
+      - "4444:4444"  # WebDriver
+      - "7900:7900"  # noVNC
+    # 为 Linux Engine 提供宿主别名（Windows/Mac 的 Docker Desktop 通常已内置）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
