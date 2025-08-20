@@ -14,6 +14,8 @@ import os
 import subprocess
 import sys
 import time
+import re
+import random
 from pathlib import Path
 
 import requests
@@ -30,6 +32,8 @@ DEFAULT_CONTAINER = "lm_cf_browser"
 WEBDRIVER_URL = "http://localhost:4444/wd/hub"
 NOVNC_URL = "http://localhost:7900/?autoconnect=1&resize=scale&password=secret"
 AVAILABLE_MODELS_PATH = ROOT / "available_models.json"
+SOCKS_LOCK_PATH = ROOT / "socks5.lock.json"
+CONFIG_PATH = ROOT / "config.jsonc"
 
 def run(cmd: list[str], check=True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
@@ -136,6 +140,129 @@ def load_userscript() -> str:
     combined = build_polyfills() + "\n" + raw
     return patch_userscript_for_docker(combined)
 
+# ===================== SOCKS5 支持与探测 =====================
+
+def _strip_jsonc(text: str) -> str:
+    # 移除 // 行注释 与 /* ... */ 块注释（简单实现，足够解析我们用到的键）
+    text = re.sub(r"//.*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return text
+
+def load_config() -> dict:
+    try:
+        if not CONFIG_PATH.exists():
+            return {}
+        raw = CONFIG_PATH.read_text(encoding="utf-8")
+        clean = _strip_jsonc(raw)
+        return json.loads(clean or "{}")
+    except Exception:
+        return {}
+
+def normalize_socks5(value: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if not (v.startswith("socks5://") or v.startswith("socks5h://")):
+        v = "socks5://" + v
+    return v
+
+def load_socks_candidates_from_args_and_config(args) -> list[str]:
+    cands: list[str] = []
+    # 来自命令行
+    if getattr(args, "socks5", None):
+        for part in (args.socks5 or "").split(","):
+            p = normalize_socks5(part)
+            if p:
+                cands.append(p)
+    # 来自配置（需显式开启）
+    cfg = load_config()
+    if cfg.get("socks5_enabled", False):
+        for part in (cfg.get("socks5_candidates") or []):
+            p = normalize_socks5(str(part))
+            if p:
+                cands.append(p)
+    # 去重，保持顺序
+    uniq: list[str] = []
+    seen = set()
+    for p in cands:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
+
+def read_locked_socks5() -> str | None:
+    try:
+        if SOCKS_LOCK_PATH.exists():
+            data = json.loads(SOCKS_LOCK_PATH.read_text(encoding="utf-8"))
+            p = data.get("proxy")
+            p = normalize_socks5(p) if p else None
+            if p:
+                print(f"[SOCKS] 读取锁定代理: {p}")
+            return p
+    except Exception:
+        pass
+    return None
+
+def write_locked_socks5(proxy: str) -> None:
+    try:
+        SOCKS_LOCK_PATH.write_text(
+            json.dumps({"proxy": proxy, "ts": int(time.time())}, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        print(f"[SOCKS] 已锁定并保存 SOCKS5: {proxy} -> {SOCKS_LOCK_PATH}")
+    except Exception as e:
+        print(f"[SOCKS] 写入锁文件失败: {e}")
+
+def create_chrome_options(proxy: str | None = None, user_data_dir: str | None = None) -> ChromeOptions:
+    options = ChromeOptions()
+    options.page_load_strategy = "eager"
+    # 允许混合内容与本地自签证书，便于 https 页面对接本机 http/ws 服务
+    options.add_argument("--disable-web-security")
+    options.add_argument("--allow-running-insecure-content")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--allow-insecure-localhost")
+    options.add_argument("--disable-features=BlockInsecurePrivateNetworkRequests")
+    options.set_capability("acceptInsecureCerts", True)
+    if proxy:
+        options.add_argument(f"--proxy-server={proxy}")
+        print(f"[SOCKS] 使用代理: {proxy}")
+    if user_data_dir:
+        options.add_argument(f"--user-data-dir={user_data_dir}")
+        print(f"[SOCKS] 使用新的用户数据目录: {user_data_dir}")
+    return options
+
+def create_driver_with(proxy: str | None = None, user_data_dir: str | None = None):
+    opts = create_chrome_options(proxy, user_data_dir)
+    try:
+        drv = webdriver.Remote(command_executor=WEBDRIVER_URL, options=opts)
+        return drv
+    except Exception as e:
+        print(f"[SOCKS] 创建带代理的浏览器会话失败: {e}")
+        return None
+
+def probe_site_reachable(driver, url: str, timeout_sec: int = 15) -> bool:
+    try:
+        driver.set_page_load_timeout(timeout_sec)
+        driver.get(url)
+        WebDriverWait(driver, timeout_sec).until(
+            lambda d: d.execute_script("return document.readyState")== "complete"
+        )
+        return True
+    except Exception as e:
+        print(f"[SOCKS] 站点连通性检测失败: {e}")
+        return False
+
+def clear_browser_data(driver) -> None:
+    # 清理缓存与 Cookie，尽可能“清空浏览器数据”
+    try:
+        driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+    except Exception:
+        pass
+
 def add_userscript_on_new_document(driver, script_src: str) -> None:
     # 在每个新文档 document_start 注入
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script_src})
@@ -238,29 +365,94 @@ def main():
     parser.add_argument("--keep-container", action="store_true", help="退出时保留容器不停止")
     parser.add_argument("--self-test", action="store_true", help="启动后执行连通性自检（需本机 api_server.py 已运行）")
     parser.add_argument("--test-timeout", type=int, default=45, help="连通性自检的最大等待秒数（默认 45s）")
+    # SOCKS5 相关
+    parser.add_argument(
+        "--socks5",
+        default="",
+        help="启用 SOCKS5 代理。可传入逗号分隔的多个值，例如 host1:1080,host2:1080 或 socks5://user:pass@host:1080；若留空则不启用"
+    )
+    parser.add_argument(
+        "--socks-test-timeout",
+        type=int,
+        default=15,
+        help="SOCKS5 可用性探测超时秒数（默认 15s）"
+    )
     args = parser.parse_args()
 
     ensure_container(args.image, args.name)
     wait_webdriver_ready()
 
-    # 连接 Remote WebDriver
-    options = ChromeOptions()
-    options.page_load_strategy = "eager"
-    # 允许混合内容与本地自签证书，便于 https 页面对接本机 http/ws 服务
-    options.add_argument("--disable-web-security")
-    options.add_argument("--allow-running-insecure-content")
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--allow-insecure-localhost")
-    options.add_argument("--disable-features=BlockInsecurePrivateNetworkRequests")
-    options.set_capability("acceptInsecureCerts", True)
+    # 选择/锁定 SOCKS5 并创建浏览器会话
+    cfg = load_config()
+    socks_enabled = bool(getattr(args, "socks5", "").strip()) or bool(cfg.get("socks5_enabled", False))
+    candidates = load_socks_candidates_from_args_and_config(args) if socks_enabled else []
+    locked = read_locked_socks5() if socks_enabled else None
+    # 构造尝试序列：先尝试锁定，再尝试候选
+    try_seq: list[str] = []
+    if locked:
+        try_seq.append(locked)
+    for c in candidates:
+        if c not in try_seq:
+            try_seq.append(c)
 
-    driver = webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
+    driver = None
+    chosen_proxy: str | None = None
+    need_new_profile_for_next = False
 
-    # 对每个新 document 注入 userscript
+    if try_seq:
+        for idx, proxy in enumerate(try_seq):
+            # 先试“锁定”的原配置；若失败，再为新候选使用全新用户数据目录
+            user_dir = None
+            if idx == 0 and locked:
+                drv = create_driver_with(proxy)
+                if drv and probe_site_reachable(drv, args.url, timeout_sec=args.socks_test_timeout):
+                    driver = drv
+                    chosen_proxy = proxy
+                    break
+                else:
+                    if drv:
+                        try:
+                            clear_browser_data(drv)
+                        except Exception:
+                            pass
+                        try:
+                            drv.quit()
+                        except Exception:
+                            pass
+                    need_new_profile_for_next = True
+                    continue
+            # 其他候选：使用新的用户数据目录，等同“清除浏览器数据”
+            suffix = f"{int(time.time())}-{random.randint(1000,9999)}"
+            user_dir = f"/tmp/chrome-profile-{suffix}"
+            drv = create_driver_with(proxy, user_data_dir=user_dir)
+            if drv and probe_site_reachable(drv, args.url, timeout_sec=args.socks_test_timeout):
+                driver = drv
+                chosen_proxy = proxy
+                break
+            else:
+                if drv:
+                    try:
+                        drv.quit()
+                    except Exception:
+                        pass
+
+        if driver is None:
+            print("[SOCKS] 未找到可用的 SOCKS5 代理，退出。")
+            sys.exit(1)
+
+        if chosen_proxy:
+            write_locked_socks5(chosen_proxy)
+
+    else:
+        # 未设置 SOCKS5：不使用代理
+        driver = create_driver_with(None)
+        if not driver:
+            print("[ERROR] 无法连接到 Remote WebDriver")
+            sys.exit(1)
+
+    # 对每个新 document 注入 userscript，并重新加载目标页以生效
     script_src = load_userscript()
     add_userscript_on_new_document(driver, script_src)
-
-    # 导航到目标页
     navigate(driver, args.url)
 
     # 检测 CF

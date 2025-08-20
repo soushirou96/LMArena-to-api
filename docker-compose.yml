@@ -10,6 +10,19 @@ services:
     ports:
       - "4444:4444"  # WebDriver
       - "7900:7900"  # noVNC
+
+    # 代理相关环境（可选）
+    # 说明：
+    # - Selenium/Chrome 不会自动使用这些环境变量作为浏览器代理；
+    #   Chrome 的 SOCKS5 需通过引导器参数 --socks5 注入（见 README）。
+    # - 这些变量仅用于容器内其他工具（若有）或便于统一管理。
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - NO_PROXY=127.0.0.1,localhost,host.docker.internal
+      - ALL_PROXY=${ALL_PROXY:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+
     # 为 Linux Engine 提供宿主别名（Windows/Mac 的 Docker Desktop 通常已内置）
     extra_hosts:
       - "host.docker.internal:host-gateway"
