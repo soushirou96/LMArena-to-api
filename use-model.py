@@ -19,13 +19,13 @@ def main():
     for item in models_data:
         public_name = item.get("publicName")
         model_id = item.get("id")
-        input_caps = item.get("capabilities", {}).get("outputCapabilities", {})
+        output_caps = item.get("capabilities", {}).get("outputCapabilities", {})
 
         if not public_name or not model_id:
             continue
 
-        # 如果是图像模型，加上 :image
-        if input_caps.get("image") is True:
+        # 如果输出能力包含 image，则加上 :image
+        if "image" in output_caps:
             models_json[public_name] = f"{model_id}:image"
         else:
             models_json[public_name] = model_id
