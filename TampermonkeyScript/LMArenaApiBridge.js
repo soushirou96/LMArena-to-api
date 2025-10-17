@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LMArena API Bridge
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Bridges LMArena to a local API server via WebSocket for streamlined automation.
 // @author       Lianues
 // @match        https://lmarena.ai/*
@@ -18,15 +18,80 @@
     const SERVER_URL = "ws://localhost:5102/ws"; // 与 api_server.py 中的端口匹配
     let socket;
     let isCaptureModeActive = false; // ID捕获模式的开关
+    let isAuthenticated = false; // 认证状态标志
+
+    // --- 认证检查 ---
+    function checkAuthCookie() {
+        // 检查是否存在 arena-auth-prod-v1 cookie
+        const cookies = document.cookie.split(';');
+        for (let cookie of cookies) {
+            const trimmed = cookie.trim();
+            if (trimmed.startsWith('arena-auth-prod-v1=')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    async function ensureAuthentication() {
+        console.log("[API Bridge] 正在检查认证状态...");
+        
+        if (checkAuthCookie()) {
+            console.log("[API Bridge] ✅ 检测到认证 cookie，认证已完成。");
+            isAuthenticated = true;
+            return true;
+        }
+
+        console.log("[API Bridge] ⚠️ 未检测到认证 cookie，正在尝试初始化会话...");
+        
+        try {
+            // 尝试通过访问主页来触发会话创建
+            // LMArena 通常会在首次访问时自动创建匿名会话
+            const response = await fetch('/', {
+                method: 'GET',
+                credentials: 'include',
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                }
+            });
+
+            if (response.ok) {
+                // 等待一小段时间让 cookie 设置完成
+                await new Promise(resolve => setTimeout(resolve, 500));
+                
+                if (checkAuthCookie()) {
+                    console.log("[API Bridge] ✅ 会话初始化成功，认证已完成。");
+                    isAuthenticated = true;
+                    return true;
+                } else {
+                    console.warn("[API Bridge] ⚠️ 会话初始化后仍未检测到认证 cookie。");
+                    console.warn("[API Bridge] 请尝试刷新页面或手动进行一次对话以建立会话。");
+                    isAuthenticated = false;
+                    return false;
+                }
+            } else {
+                console.error("[API Bridge] ❌ 会话初始化失败，状态码:", response.status);
+                isAuthenticated = false;
+                return false;
+            }
+        } catch (error) {
+            console.error("[API Bridge] ❌ 认证检查过程中出错:", error);
+            isAuthenticated = false;
+            return false;
+        }
+    }
 
     // --- 核心逻辑 ---
     function connect() {
         console.log(`[API Bridge] 正在连接到本地服务器: ${SERVER_URL}...`);
         socket = new WebSocket(SERVER_URL);
 
-        socket.onopen = () => {
+        socket.onopen = async () => {
             console.log("[API Bridge] ✅ 与本地服务器的 WebSocket 连接已建立。");
             document.title = "✅ " + document.title;
+            
+            // 连接建立后立即检查认证状态
+            await ensureAuthentication();
         };
 
         socket.onmessage = async (event) => {
@@ -83,6 +148,19 @@
     async function executeFetchAndStreamBack(requestId, payload) {
         console.log(`[API Bridge] 当前操作域名: ${window.location.hostname}`);
         const { is_image_request, message_templates, target_model_id, session_id, message_id } = payload;
+
+        // --- 检查认证状态 ---
+        if (!isAuthenticated) {
+            console.warn("[API Bridge] ⚠️ 认证未完成，正在尝试重新认证...");
+            const authSuccess = await ensureAuthentication();
+            if (!authSuccess) {
+                const errorMsg = "认证失败：未检测到有效的 LMArena 认证 cookie。请刷新页面或手动进行一次对话以建立会话。";
+                console.error(`[API Bridge] ${errorMsg}`);
+                sendToServer(requestId, { error: errorMsg });
+                sendToServer(requestId, "[DONE]");
+                return;
+            }
+        }
 
         // --- 使用从后端配置传递的会话信息 ---
         if (!session_id || !message_id) {
@@ -272,9 +350,10 @@
 
     // --- 启动连接 ---
     console.log("========================================");
-    console.log("  LMArena API Bridge v2.5 正在运行。");
+    console.log("  LMArena API Bridge v2.6 正在运行。");
     console.log("  - 聊天功能已连接到 ws://localhost:5102");
     console.log("  - ID 捕获器将发送到 http://localhost:5103");
+    console.log("  - 增强的认证检查和会话初始化");
     console.log("========================================");
     
     connect(); // 建立 WebSocket 连接
