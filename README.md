@@ -1,5 +1,8 @@
 # 🚀 LMArena Bridge - AI模型竞技场API代理器 🌉
 
+> **📖 For English setup instructions, see [SETUP.md](SETUP.md)**  
+> **📖 中文安装说明请继续阅读本文档**
+
 欢迎来到新一代的 LMArena Bridge！🎉 这是一个基于 FastAPI 和 WebSocket 的高性能工具集，它能让你通过任何兼容 OpenAI API 的客户端或应用程序，无缝使用 [LMArena.ai](https://lmarena.ai/) 平台上提供的海量大语言模型。
 
 这个重构版本旨在提供更稳定、更易于维护和扩展的体验。
